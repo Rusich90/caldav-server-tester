@@ -8,6 +8,16 @@ This project should adhere to [Semantic Versioning](https://semver.org/spec/v2.0
 
 This library is tightly dependent on the CalDAV-library, particularly the `compatibility_hints.py`-file.  This file is not (yet) considered to be part of the "core" business logic in the CalDAV library and can be changed in patch-releases in the CalDAV library - so this library is usually released in lock-steps with the CalDAV-library.  I've considered to bump the version number to be follow the CalDAV version number.
 
+## Unreleased
+
+### Added
+
+- **`save-load.event.no-dtend`** - whether a VEVENT with neither DTEND nor DURATION is stored.  RFC 5545 section 3.6.1 allows one; iCloud refuses it with a 404, or a 403.  Needs a caldav library that knows the feature.  See https://github.com/python-caldav/caldav-server-tester/issues/24.
+
+### Fixed
+
+- **`save-load.event.no-summary`** - a 401 is graded `unknown` rather than `ungraceful`: on a session that is already authenticated it is no answer to the request, and iCloud answers 401 to anything for a while after a run of 429s.
+
 ## 1.4.0 - 2026-10-08
 
 This release works with caldav 3.4.0.

@@ -3358,6 +3358,35 @@ def dav_error_status(exc):
 TRANSIENT_STATUSES = frozenset({502, 503, 504})
 
 
+def refusal_status(exc):
+    """The status the server refused a request with, or None for a gateway, an
+    overload, rate limiting or no answer, which say nothing about the request."""
+    if isinstance(exc, AuthorizationError):
+        ## Raised alike for 401 and 403, carrying the URL rather than the
+        ## status, so only the reason tells them apart.  A 401 on a session
+        ## that is already authenticated is no answer to the request: iCloud
+        ## answers 401 to anything for a while after a run of 429s.
+        if exc.reason == "Unauthorized":
+            return None
+        return dav_error_status(exc) or "401/403"
+    status = dav_error_status(exc)
+    if status is None or status in TRANSIENT_STATUSES:
+        return None
+    return status
+
+
+def graded_refusal(exc, refused):
+    """``refused`` (with ``{answer}`` for the status) where the server
+    answered; unknown where it did not, which must not end up in a profile."""
+    answer = refusal_status(exc)
+    if answer is None:
+        return {
+            "support": "unknown",
+            "behaviour": f"cannot test, the request failed without an answer from the server ({exc})",
+        }
+    return {"support": "ungraceful", "behaviour": refused.format(answer=answer)}
+
+
 def is_server_failure(status) -> bool:
     """A 5xx the server software is to blame for, rather than a gateway or overload."""
     return status is not None and status >= 500 and status not in TRANSIENT_STATUSES
@@ -4233,23 +4262,6 @@ class CheckEventWithoutSummary(Check):
     depends_on = {PrepareCalendar}
     features_to_be_checked = {"save-load.event.no-summary"}
 
-    @staticmethod
-    def _graded_failure(exc, refused):
-        """``refused`` (with ``{answer}`` for the status) where the server
-        answered; unknown for a gateway, an overload, rate limiting or no answer,
-        which say nothing about SUMMARY and must not end up in a profile."""
-        if isinstance(exc, AuthorizationError):
-            ## Raised alike for 401 and 403, carrying the URL rather than the status.
-            answer = dav_error_status(exc) or "401/403"
-        else:
-            answer = dav_error_status(exc)
-            if answer is None or answer in TRANSIENT_STATUSES:
-                return {
-                    "support": "unknown",
-                    "behaviour": f"cannot test, the request failed without an answer from the server ({exc})",
-                }
-        return {"support": "ungraceful", "behaviour": refused.format(answer=answer)}
-
     def _run_check(self) -> None:
         cal = self.checker.calendar
         start = datetime.now(tz=utc) + timedelta(days=30)
@@ -4258,7 +4270,7 @@ class CheckEventWithoutSummary(Check):
         except (DAVError, AuthorizationError) as exc:
             self.set_feature(
                 "save-load.event.no-summary",
-                self._graded_failure(
+                graded_refusal(
                     exc,
                     "a VEVENT without SUMMARY is refused ({answer}), though RFC 5545 section 3.6.1 makes SUMMARY optional",
                 ),
@@ -4275,13 +4287,74 @@ class CheckEventWithoutSummary(Check):
         except (DAVError, AuthorizationError) as exc:
             self.set_feature(
                 "save-load.event.no-summary",
-                self._graded_failure(exc, "a VEVENT without SUMMARY is accepted, but reading it back fails ({answer})"),
+                graded_refusal(exc, "a VEVENT without SUMMARY is accepted, but reading it back fails ({answer})"),
             )
         finally:
             try:
                 ev.delete()
             except Exception:
                 pass
+
+
+class CheckEventWithoutDtend(Check):
+    """
+    Checks whether a VEVENT with neither DTEND nor DURATION can be stored.
+
+    RFC 5545 section 3.6.1 allows one: an event on a date lasts that day, an
+    event at a date-time ends when it starts.  iCloud refuses both (404).
+    PrepareCalendar works around such a refusal for its own fixtures, so this
+    is the probe that reports it.  Both kinds are probed, and the worse
+    verdict is kept.
+    """
+
+    depends_on = {PrepareCalendar}
+    features_to_be_checked = {"save-load.event.no-dtend"}
+
+    def _probe(self, uid, dtstart, kind):
+        """None if the event is stored, else the verdict."""
+        try:
+            ev = self.checker.calendar.add_event(uid=uid, summary=f"event {kind}, without an end", dtstart=dtstart)
+        except (DAVError, AuthorizationError) as exc:
+            return graded_refusal(
+                exc,
+                f"a VEVENT {kind} and neither DTEND nor DURATION is refused ({{answer}}), "
+                "though RFC 5545 section 3.6.1 allows it",
+            )
+        try:
+            ev.load()
+        except NotFoundError:
+            return {"support": "unsupported", "behaviour": f"a VEVENT {kind} and no end is accepted but not stored"}
+        except (DAVError, AuthorizationError) as exc:
+            return graded_refusal(
+                exc, f"a VEVENT {kind} and no end is accepted, but reading it back fails ({{answer}})"
+            )
+        finally:
+            try:
+                ev.delete()
+            except Exception:
+                pass
+        return None
+
+    def _run_check(self) -> None:
+        start = datetime.now(tz=utc).replace(microsecond=0) + timedelta(days=30)
+        verdicts = [
+            verdict
+            for verdict in (
+                self._probe("csc_no_dtend", start, "with a start time"),
+                self._probe("csc_no_dtend_allday", start.date(), "on a date"),
+            )
+            if verdict is not None
+        ]
+        if not verdicts:
+            self.set_feature("save-load.event.no-dtend")
+            return
+        ## The worse verdict wins; with both refused, both are described.
+        verdict = verdicts[0]
+        if len(verdicts) == 2:
+            if is_worse(verdicts[1]["support"], verdict["support"]):
+                verdict = verdicts[1]
+            verdict = {**verdict, "behaviour": "; ".join(v["behaviour"] for v in verdicts)}
+        self.set_feature("save-load.event.no-dtend", verdict)
 
 
 class CheckRescheduleRecurrenceSeries(Check):
