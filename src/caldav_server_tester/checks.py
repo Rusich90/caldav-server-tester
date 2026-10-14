@@ -1945,6 +1945,25 @@ class PrepareCalendar(Check):
                 except Exception:
                     self.set_feature("save-load.journal", "ungraceful")
 
+    def _add_without_end(self, add_if_not_existing, **kwargs):
+        """Add a VEVENT with neither DTEND nor DURATION, as RFC 5545 allows.
+
+        iCloud refuses one (see CheckEventWithoutDtend), which must not end the
+        setup: a refused all-day fixture gets the one-day DTEND RFC 5545 section
+        3.6.1 implies, and the timed one, which no check reads, is skipped.  A
+        gateway error or no answer is raised as before.
+        """
+        try:
+            return add_if_not_existing(Event, **kwargs)
+        except (DAVError, AuthorizationError) as exc:
+            if refusal_status(exc) is None:
+                raise
+            if isinstance(kwargs["dtstart"], datetime):
+                logging.warning("Server refused %s, an event without an end (%s); skipped", kwargs["uid"], exc)
+                return None
+            logging.warning("Server refused %s, an event without an end (%s); adding DTEND", kwargs["uid"], exc)
+            return add_if_not_existing(Event, dtend=kwargs["dtstart"] + timedelta(days=1), **kwargs)
+
     def _create_test_events(self, calendar, cal_id, name, add_if_not_existing):
         """Create all the test event/task/journal objects in the calendar.
 
@@ -1981,15 +2000,15 @@ class PrepareCalendar(Check):
         simple_event.load()
         self.set_feature("save-load.event")
 
-        non_duration_event = add_if_not_existing(
-            Event,
+        non_duration_event = self._add_without_end(
+            add_if_not_existing,
             summary="event with a start time but no end time",
             uid="csc_simple_event2",
             dtstart=datetime(base, 1, 2, 12, 0, 0, tzinfo=utc),
         )
 
-        one_day_event = add_if_not_existing(
-            Event,
+        one_day_event = self._add_without_end(
+            add_if_not_existing,
             summary="event with a start date but no end date",
             uid="csc_simple_event3",
             dtstart=date(base, 1, 3),
@@ -2098,8 +2117,8 @@ class PrepareCalendar(Check):
         ## master (<base>-02-01) and inside sliding-window servers' search windows -
         ## a yearly rrule would put the second occurrence ~2 years out, outside
         ## e.g. OX's window, producing a false "broken for all-day events" verdict.
-        add_if_not_existing(
-            Event,
+        self._add_without_end(
+            add_if_not_existing,
             summary="monthly recurring all-day event",
             uid="csc_monthly_recurring_allday_event",
             rrule={"FREQ": "MONTHLY"},
@@ -3251,13 +3270,17 @@ END:VCALENDAR""",
                 return object_by_uid.pop(uid)
             try:
                 return cal.save_object(*largs, **kwargs)
-            except PutError:
+            except PutError as put_exc:
                 ## 409 Conflict: object exists but is hidden from search
                 ## (e.g. OX's sliding window hides old objects from REPORT/PROPFIND).
                 ## Try to load the existing object by constructing its URL directly.
                 obj_class = largs[0]
                 existing = url_object(cal, uid, obj_class)
-                existing.load()
+                try:
+                    existing.load()
+                except NotFoundError:
+                    ## Not there either: the PUT was refused, and its error tells why.
+                    raise put_exc from None
                 return existing
 
         self._create_test_events(calendar, cal_id, name, add_if_not_existing)

@@ -16,6 +16,7 @@ This library is tightly dependent on the CalDAV-library, particularly the `compa
 
 ### Fixed
 
+- **`PrepareCalendar`** - stopped at the first VEVENT without an end that the server refused (iCloud), so the fixtures after it were missing and e.g. `search.recurrences.*` and `search.time-range.event.old-dates` came out wrong.  A refused all-day fixture now gets the one-day DTEND RFC 5545 implies, and the timed one is skipped.
 - **`save-load.event.no-summary`** - a 401 is graded `unknown` rather than `ungraceful`: on a session that is already authenticated it is no answer to the request, and iCloud answers 401 to anything for a while after a run of 429s.
 
 ## 1.4.0 - 2026-10-08
